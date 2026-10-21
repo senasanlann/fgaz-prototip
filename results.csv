@@ -1,0 +1,5 @@
+senaryo,90 günde eksik (%),kaçak başlangıcı (gün),AI ilk kırmızı (gün),klasik alarm (gün),kaç gün önce,AI tespitinde eksik (%),AI'a kadar kaçan (kg),klasiğe/sona kadar kaçan (kg),kaçak öncesi yanlış kırmızı (gün)
+leak_05,5,30,100,çalmadı,">= 19 (klasik çalmadı, sim. sonuna göre)",3.9,1.94,2.47,0
+leak_10,10,30,72,çalmadı,">= 47 (klasik çalmadı, sim. sonuna göre)",4.7,2.33,4.94,0
+leak_20,20,30,55,çalmadı,">= 64 (klasik çalmadı, sim. sonuna göre)",5.6,2.78,9.89,0
+leak_40,40,30,53,106,53,10.2,5.11,16.89,0

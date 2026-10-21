@@ -34,7 +34,20 @@ FEATURES = {
     "hour_cos":   "Saat (cos)",             # bağlam
     "weekend":    "Hafta sonu",             # bağlam (mağaza yükü hafta sonu daha yüksek)
 }
-CONTEXT = ["t_amb", "hour_sin", "hour_cos", "weekend"]   # açıklamada "neden" olarak gösterilmez
+CONTEXT = ["t_amb", "hour_sin", "hour_cos", "weekend"]   # modele girdi, skora dahil değil
+
+# Gaz kaçağının fiziksel "imzası": her özelliğin kaçakta hangi yöne saptığı (+1 artar, -1 azalır).
+# Skor sadece bu yöndeki sapmaları sayar. Ters yöndeki sapmalar (ör. emme basıncının
+# beklenenden YÜKSEK olması) kaçak belirtisi değildir; sayılsaydı sağlıklı dolaptaki yavaş
+# kaymalar yanlış alarm üretirdi (evaluate.py'deki ek sağlıklı serilerde görüldü).
+LEAK_SIGN = {
+    "p_suction": -1,    # emme basıncı düşer
+    "superheat": +1,    # kızgınlık artar
+    "duty": +1,         # kompresör daha uzun çalışır
+    "kwh": +1,          # enerji tüketimi artar
+    "t_cab_mean": +1,   # (ağır kaçakta) kabin ısınır
+    "t_cab_max": +1,
+}
 
 
 def make_windows(df):
@@ -69,10 +82,15 @@ def make_windows(df):
 
 
 def _feature_errors(bundle, windows):
-    """Her pencere ve her özellik için ölçekli uzaydaki kare hata + beklenen değer."""
+    """
+    Her pencere ve her özellik için kaçak yönündeki kare hata (ölçekli uzayda) + beklenen değer.
+    Bağlam özellikleri skora katılmaz; modele sadece girdi olarak verilir.
+    """
     X = bundle["scaler"].transform(windows[list(FEATURES)])
     X_hat = bundle["mlp"].predict(X)
-    sq_err = pd.DataFrame((X - X_hat) ** 2, index=windows.index, columns=list(FEATURES))
+    resid = pd.DataFrame(X - X_hat, index=windows.index, columns=list(FEATURES))
+    sign = pd.Series(LEAK_SIGN)
+    sq_err = (resid[sign.index] * sign).clip(lower=0) ** 2
     expected = pd.DataFrame(bundle["scaler"].inverse_transform(X_hat),
                             index=windows.index, columns=list(FEATURES))
     return sq_err, expected
@@ -81,7 +99,7 @@ def _feature_errors(bundle, windows):
 def _daily(bundle, windows):
     """Pencere hatalarından günlük ham ve yumuşatılmış skor."""
     sq_err, expected = _feature_errors(bundle, windows)
-    win_score = sq_err.mean(axis=1)                     # pencere MSE'si
+    win_score = sq_err.mean(axis=1)                     # pencere MSE'si (kaçak yönünde)
     # dropna: farklı dönemlerden birleştirilmiş verideki boş günleri atar
     daily = win_score.resample("1D").mean().dropna().to_frame("score_raw")
     # İlk SMOOTH_DAYS-1 gün skor üretilmez (ortalama henüz dolmadı -> oynak olurdu)
@@ -120,7 +138,7 @@ def score(bundle, df):
                                 ["veri yetersiz", "kırmızı", "sarı"], "yeşil")
 
     # Özellik bazlı katkı (bağlam özellikleri hariç) ve gerçek - beklenen farkı
-    cols = [c for c in FEATURES if c not in CONTEXT]
+    cols = list(LEAK_SIGN)
     contrib = sq_err[cols].resample("1D").mean().dropna().rolling(SMOOTH_DAYS, min_periods=1).mean()
     diff = (windows[cols] - expected[cols]).resample("1D").mean().dropna()
     diff = diff.rolling(SMOOTH_DAYS, min_periods=1).mean()
@@ -155,38 +173,29 @@ def load(path="data/model.joblib"):
 
 
 if __name__ == "__main__":
-    # Hızlı deneme: dataset.py olmadan doğrudan simülatörden sağlıklı veri üretir.
-    from simulator import simulate
-
-    # Eğitim: yılın her ayından 10'ar gün (toplam 120 gün) -> tüm mevsim koşulları görülür
-    train_w = pd.concat([make_windows(simulate(10, start=f"2025-{m:02d}-01", seed=100 + m)[0])
-                         for m in range(1, 13)])
-    # Doğrulama (eşik için): her ayın ortasından, yeni tohumlarla 10'ar gün
-    val_w = pd.concat([make_windows(simulate(10, start=f"2025-{m:02d}-15", seed=200 + m)[0])
-                       for m in range(1, 13)])
+    # dataset.py'nin ürettiği sağlıklı eğitim/doğrulama verisiyle eğitir ve kaydeder.
+    import dataset
+    import os
+    if not os.path.exists(f"{dataset.DATA_DIR}/scenarios.csv"):
+        dataset.build_all()
+    train_df, _ = dataset.load("train_healthy")
+    val_df, _ = dataset.load("val_healthy")
+    train_w = pd.concat([make_windows(s) for s in dataset.segments(train_df)])
+    val_w = pd.concat([make_windows(s) for s in dataset.segments(val_df)])
 
     bundle = train(train_w, val_w)
     save(bundle)
     print(f"Eğitim pencere sayısı: {len(train_w)}, doğrulama: {len(val_w)}")
     print(f"Eşik (doğrulama günlük skorlarının %{THRESHOLD_PCT}'i): {bundle['threshold']:.4f}")
 
-    # Ön kontrol 1: hiç görülmemiş 60 günlük sağlıklı seri -> yanlış alarm var mı?
-    h, _ = simulate(60, start="2025-05-15", seed=99)
-    hs = score(bundle, h)
-    print(f"\nSağlıklı test (60 gün): sarı gün={int((hs.status == 'sarı').sum())}, "
-          f"kırmızı gün={int((hs.status == 'kırmızı').sum())}")
-
-    # Ön kontrol 2: 30. günden sonra yavaşça %20 eksiğe giden kaçak (120 gün)
-    n = 120 * 96
-    t = np.arange(n) / 96
-    charge = np.where(t < 30, 1.0, 1.0 - 0.20 * (t - 30) / 90)
-    leak, truth = simulate(120, start="2025-03-01", charge_ratio=charge, seed=7)
-    ls = score(bundle, leak)
-    ls["gun"] = np.arange(len(ls))
-    first_red = ls.loc[ls.status == "kırmızı", "gun"].min()
-    print(f"\n%20 kaçak senaryosu: kaçak başlangıcı = gün 30, ilk kırmızı = gün {first_red}, "
-          f"o gün eksik gaz = %{100 * (1 - truth.iloc[int(first_red) * 96]):.1f}")
-    print("İlk kırmızı gündeki açıklama:", explain(ls.loc[ls.gun == first_red].iloc[0]))
-    print("\nÖrnek günler:")
-    print(ls.loc[ls.gun.isin([10, 29, 35, 40, 45, 50, 60, 90, 119]),
-                 ["gun", "score", "status", "top1", "top2"]].round(4).to_string())
+    # Ön kontrol: %20 kaçak senaryosu
+    df, charge = dataset.load("leak_20")
+    daily = score(bundle, df)
+    red = [i for i, s in enumerate(daily["status"]) if s == "kırmızı"]
+    if red:
+        day = red[0]
+        print(f"\nleak_20: kaçak başlangıcı = gün 30, ilk kırmızı = gün {day}, "
+              f"o gün eksik gaz = %{100 * (1 - charge.iloc[day * 96]):.1f}")
+        print("Açıklama:", explain(daily.iloc[day]))
+    else:
+        print("\nleak_20: AI kırmızı alarm vermedi")

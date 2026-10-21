@@ -6,8 +6,10 @@ dataset.py - Eğitim ve test senaryolarını üretir, data/ klasörüne kaydeder
   data/<senaryo>_label.parquet  -> gerçek şarj oranı (sadece değerlendirme için, model görmez)
   data/scenarios.csv            -> senaryo listesi: tohum, başlangıç tarihi, kaçak bilgisi
 
-Sağlıklı eğitim ve doğrulama verisi, tüm mevsimleri görmek için yılın her ayından
-10'ar günlük parçalardan oluşur. Parçalar "segment" kolonu ile ayrılır.
+Sağlıklı eğitim verisi, tüm mevsimleri görmek için yılın her ayından 10'ar günlük
+parçalardan oluşur (120 gün). Doğrulama verisi (eşik için) her aydan 30'ar gündür (360 gün):
+sağlıklı dolaptaki yavaş kaymalar ~10 gün sürdüğü için eşiği güvenilir belirlemek
+çok sayıda bağımsız örnek gerektirir. Parçalar "segment" kolonu ile ayrılır.
 """
 
 import os
@@ -26,7 +28,7 @@ LEAK_DAYS = LEAK_START_DAY + LEAK_RAMP_DAYS   # 120 gün
 SCENARIOS = [
     # ad,              tür,        gün, başlangıç,     tohum, son eksiklik
     ("train_healthy",  "train",    120, None,          100,   0.00),
-    ("val_healthy",    "val",      120, None,          200,   0.00),
+    ("val_healthy",    "val",      360, None,          200,   0.00),
     ("test_healthy",   "healthy",   60, "2025-05-01",  300,   0.00),
     ("leak_05",        "leak",     120, "2025-03-01",  405,   0.05),
     ("leak_10",        "leak",     120, "2025-03-01",  410,   0.10),
@@ -42,11 +44,11 @@ def leak_profile(days, final_deficit):
     return 1.0 - final_deficit * ramp
 
 
-def make_monthly_segments(seed, day_of_month):
-    """Yılın her ayından 10 günlük sağlıklı parça (toplam 120 gün), 'segment' kolonu ile."""
+def make_monthly_segments(seed, days_per_month):
+    """Yılın her ayının başından `days_per_month` günlük sağlıklı parça, 'segment' kolonu ile."""
     parts, labels = [], []
     for m in range(1, 13):
-        df, truth = simulate(10, start=f"2025-{m:02d}-{day_of_month:02d}", seed=seed + m)
+        df, truth = simulate(days_per_month, start=f"2025-{m:02d}-01", seed=seed + m)
         df["segment"] = m
         parts.append(df)
         labels.append(truth)
@@ -59,9 +61,9 @@ def build_all(data_dir=DATA_DIR):
     rows = []
     for name, kind, days, start, seed, deficit in SCENARIOS:
         if kind == "train":
-            df, truth = make_monthly_segments(seed, day_of_month=1)
+            df, truth = make_monthly_segments(seed, days_per_month=days // 12)
         elif kind == "val":
-            df, truth = make_monthly_segments(seed, day_of_month=15)
+            df, truth = make_monthly_segments(seed, days_per_month=days // 12)
         else:
             charge = leak_profile(days, deficit)
             df, truth = simulate(days, start=start, charge_ratio=charge, seed=seed)
