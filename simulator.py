@@ -59,6 +59,22 @@ PARAMS = {
     "superheat_nom_K": 6.0,    # genleşme valfinin hedeflediği kızgınlık (K)
     "dT_evap_off_K": 2.0,      # kompresör dururken evaporatör kabine yaklaşır (kabin - 2 K)
 
+    # --- Sağlıklı dolaptaki doğal dalgalanmalar (gerçekçilik) ---
+    # Bunlar olmadan sağlıklı dolap "fazla düzgün" olur ve en küçük sapma bile hemen
+    # yakalanır; bu da sonuçları gerçekçi olmayan biçimde iyi gösterir.
+    "defrost_hours": (1, 7, 13, 19),  # günde 4 defrost (orta sıcaklık dolaplarında tipik)
+    "defrost_min": 30,         # defrost süresi (dk); kompresör zorla durur (off-cycle defrost)
+    "frost_max_K": 1.5,        # iki defrost arasında buz birikimiyle buharlaşma sıc. düşüşü (K)
+    "frost_cap_loss": 0.05,    # buz birikimiyle en fazla %5 kapasite kaybı
+    "q_ref_kW": 1.3,           # evaporatörün "tipik" ısı yükü (kW)
+    "evap_load_K_per_kW": 1.5, # yük 1 kW artınca buharlaşma sıcaklığı 1.5 K yükselir
+    "sh_load_K_per_kW": 1.5,   # yük 1 kW artınca kızgınlık 1.5 K artar (valf geç tepki verir)
+    "sh_start_K": 4.0,         # kompresör açılınca kızgınlık 4 K fazlasıyla başlar...
+    "sh_start_tau_min": 4.0,   # ...ve ~4 dakikada oturur (çok sık durup kalkmak = yüksek kızgınlık)
+    "sh_hunt_sd_K": 1.0,       # genleşme valfi salınımı (15 dk'lık adımlar arası, K)
+    "sh_drift_sd_K": 0.5,      # günler süren yavaş kayma (valf ayarı, sensör montajı, K)
+    "evap_drift_sd_K": 0.4,    # buharlaşma sıcaklığında yavaş kayma (fan/hava akışı, kirlenme, K)
+
     # --- Gaz eksikliğinin etkileri (d = 1 - charge_ratio) ---
     # Yönler literatürle uyumludur (ör. Kim & Braun 2012, Int. J. Refrig.; Mehrabi & Yuill
     # 2017): az şarjda evaporatör yeterince beslenmez -> emme basıncı düşer, kızgınlık artar,
@@ -112,6 +128,16 @@ def undercharge_effects(charge_ratio, p=PARAMS):
     }
 
 
+def ar1(n, phi, sd, rng):
+    """Ortalama 0, standart sapma `sd` olan AR(1) süreci (birbirine bağlı yavaş dalgalanma)."""
+    eps = rng.normal(0, sd * np.sqrt(1 - phi ** 2), n)
+    x = np.zeros(n)
+    x[0] = rng.normal(0, sd)
+    for i in range(1, n):
+        x[i] = phi * x[i - 1] + eps[i]
+    return x
+
+
 def make_ambient(index, rng, p=PARAMS):
     """Dış hava: mevsimsel sinüs + günlük sinüs + AR(1) hava durumu gürültüsü."""
     doy = index.dayofyear.to_numpy()
@@ -119,11 +145,7 @@ def make_ambient(index, rng, p=PARAMS):
     season = -p["t_out_season_amp"] * np.cos(2 * np.pi * (doy - 15) / 365)
     daily = p["t_out_day_amp"] * np.cos(2 * np.pi * (hour - 15) / 24)
     # AR(1): hava birkaç gün süren sıcak/soğuk dönemler yaşar
-    phi = 0.995
-    eps = rng.normal(0, p["t_out_noise_sd"] * np.sqrt(1 - phi ** 2), len(index))
-    weather = np.zeros(len(index))
-    for i in range(1, len(index)):
-        weather[i] = phi * weather[i - 1] + eps[i]
+    weather = ar1(len(index), 0.995, p["t_out_noise_sd"], rng)
     return p["t_out_mean"] + season + daily + weather
 
 
@@ -155,11 +177,16 @@ def simulate(days, start="2025-01-01", charge_ratio=1.0, seed=0, p=PARAMS):
     t_amb = make_ambient(index, rng, p)
     door = make_door_load(index, rng, p)
     eff = undercharge_effects(charge, p)
+    # Doğal dalgalanmalar: valf salınımı (hızlı) + günler süren kaymalar (yavaş)
+    sh_hunt = ar1(n, 0.5, p["sh_hunt_sd_K"], rng)
+    sh_drift = ar1(n, 0.999, p["sh_drift_sd_K"], rng)      # ~10 günlük korelasyon
+    evap_drift = ar1(n, 0.999, p["evap_drift_sd_K"], rng)
 
     n_sub = p["dt_log_min"] // p["dt_sub_min"]
     dt_s = p["dt_sub_min"] * 60
     t_cab = 4.0                     # başlangıç kabin sıcaklığı
     comp = False                    # kompresör durumu
+    run_min = 0                     # kompresör kaç dakikadır çalışıyor
     out = {k: np.zeros(n) for k in
            ["t_cabin", "p_suction_bar", "p_discharge_bar", "superheat_K", "compressor_on", "power_kW"]}
 
@@ -172,26 +199,42 @@ def simulate(days, start="2025-01-01", charge_ratio=1.0, seed=0, p=PARAMS):
         pow_run = (p["p_nom_kW"] * eff["pow_factor"][i]
                    * (1 + p["pow_per_K_cond"] * (t_cond - 35)))
 
-        on_steps, t_evap_run_sum = 0, 0.0
-        for _ in range(n_sub):
-            # Termostat (histerezis)
-            if t_cab >= p["t_on"]:
+        on_steps, t_evap_run_sum, sh_run_sum = 0, 0.0, 0.0
+        for k in range(n_sub):
+            minute = index[i].hour * 60 + index[i].minute + k * p["dt_sub_min"]
+            # Son defrosttan bu yana geçen süre -> buz birikimi oranı (0..1)
+            since_def = min((minute - h * 60) % 1440 for h in p["defrost_hours"])
+            in_defrost = since_def < p["defrost_min"]
+            frost = (since_def - p["defrost_min"]) / (360 - p["defrost_min"]) if not in_defrost else 0.0
+
+            # Termostat (histerezis); defrost sırasında kompresör zorla durur
+            if in_defrost:
+                comp = False
+            elif t_cab >= p["t_on"]:
                 comp = True
             elif t_cab <= p["t_off"]:
                 comp = False
+            run_min = run_min + p["dt_sub_min"] if comp else 0
+
             q_in = p["ua_cabin_kW_K"] * (t_store - t_cab) + door[i]
-            q_out = cap if comp else 0.0
+            q_out = cap * (1 - p["frost_cap_loss"] * frost) if comp else 0.0
             t_cab += (q_in - q_out) * dt_s / p["c_cabin_kJ_K"]
             if comp:
                 on_steps += 1
-                t_evap_run_sum += t_cab - p["dT_evap_K"] - eff["evap_drop_K"][i]
+                dq = q_in - p["q_ref_kW"]
+                t_evap_run_sum += (t_cab - p["dT_evap_K"] - eff["evap_drop_K"][i]
+                                   + p["evap_load_K_per_kW"] * dq
+                                   - p["frost_max_K"] * frost + evap_drift[i])
+                sh_run_sum += (p["superheat_nom_K"] + eff["sh_rise_K"][i]
+                               + p["sh_load_K_per_kW"] * dq
+                               + p["sh_start_K"] * np.exp(-run_min / p["sh_start_tau_min"]))
 
         on_frac = on_steps / n_sub
         # Emme basıncı ve kızgınlık: kompresör çalıştıysa çalışma sırasındaki ortalama;
         # hiç çalışmadıysa duruş değeri (evaporatör kabine yaklaşmış, kızgınlık ~0).
         if on_steps > 0:
             t_evap = t_evap_run_sum / on_steps
-            sh = p["superheat_nom_K"] + eff["sh_rise_K"][i]
+            sh = sh_run_sum / on_steps + sh_hunt[i] + sh_drift[i]
         else:
             t_evap = t_cab - p["dT_evap_off_K"]
             sh = 0.5
